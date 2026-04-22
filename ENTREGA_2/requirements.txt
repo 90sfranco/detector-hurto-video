@@ -1,0 +1,17 @@
+numpy
+pandas
+pyyaml
+pyarrow
+scikit-learn
+matplotlib
+tqdm
+
+torch
+torchvision
+ultralytics
+opencv-python
+lap
+Pillow
+
+jupyter
+ipykernel

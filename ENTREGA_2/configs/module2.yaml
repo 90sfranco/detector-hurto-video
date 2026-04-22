@@ -1,0 +1,14 @@
+video_manifest_path: outputs/module1/video_manifest.csv
+output_dir: outputs/tracking
+
+model_name: yolo11n.pt
+person_class_id: 0
+tracker: botsort.yaml
+conf: 0.25
+iou: 0.5
+persist: true
+save_preview: true
+min_track_length_frames: 5
+
+device:
+verbose: false

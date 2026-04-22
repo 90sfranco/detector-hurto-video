@@ -1,0 +1,15 @@
+video_manifest_path: outputs/module1/video_manifest.csv
+tracking_output_dir: outputs/tracking
+output_dir: outputs/person_windows
+
+person_window_seconds: 3
+person_window_stride_seconds: 1.5
+frames_per_person_window: 6
+grid_rows: 2
+grid_cols: 3
+crop_width: 128
+crop_height: 128
+bbox_padding_ratio: 0.10
+min_track_length_frames: 8
+min_valid_frames_per_window: 5
+save_debug_examples: true
