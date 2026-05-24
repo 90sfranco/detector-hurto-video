@@ -1,0 +1,27 @@
+# Ignorar .md en raiz
+/*.md
+
+# Ignorar .pt en raiz y notebooks
+/*.pt
+notebooks/*.pt
+
+# Ignorar carpetas
+EXPLANATION/
+data/
+
+# Archivos generados por ejecucion
+outputs/tracking/
+outputs/person_windows/
+outputs/app/
+outputs/models/*.pt
+
+# Solo videos/imagenes generados (no los del dataset en data/)
+/outputs/**/*.mp4
+/outputs/**/*.jpg
+/outputs/**/*.png
+
+# Manifiestos y otros
+**/manifest*
+*.log
+__pycache__/
+.ipynb_checkpoints/

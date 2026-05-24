@@ -54,13 +54,13 @@ class AppSettings:
     min_track_length_frames: int = 8
     person_window_seconds: float = 3.0
     person_window_stride_seconds: float = 1.5
-    frames_per_person_window: int = 6
-    min_valid_frames_per_window: int = 5
+    frames_per_person_window: int = 9
+    min_valid_frames_per_window: int = 7
     bbox_padding_ratio: float = 0.10
-    grid_rows: int = 2
+    grid_rows: int = 3
     grid_cols: int = 3
-    crop_width: int = 128
-    crop_height: int = 128
+    crop_width: int = 96
+    crop_height: int = 96
     cnn_image_size: int = 224
     cnn_dropout: float = 0.30
     max_frame_cache_size: int = 64
@@ -131,9 +131,6 @@ def load_classifier(
     dropout: float,
     image_size: int,
 ) -> tuple[torch.nn.Module, transforms.Compose, dict[int, str]]:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"No existe el checkpoint de ResNet en {checkpoint_path}")
-
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model = resnet50(weights=None)
     in_features = model.fc.in_features
@@ -200,6 +197,7 @@ def track_people_in_video(
 
     track_kwargs = {
         "source": str(video_path),
+        "imgsz": 480,
         "stream": True,
         "persist": True,
         "tracker": tracker_name,
@@ -1487,7 +1485,6 @@ class TheftDetectionApp:
 
 
 def main() -> None:
-    APP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     root = Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
