@@ -1,8 +1,0 @@
-{
-  "accuracy": 0.82,
-  "precision": 1.0,
-  "recall": 0.4375,
-  "f1": 0.6086956521739131,
-  "num_test_samples": 50,
-  "model_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_2\\outputs\\models\\best_model.pt"
-}

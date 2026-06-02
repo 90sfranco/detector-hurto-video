@@ -8,6 +8,7 @@ tqdm
 
 torch
 torchvision
+torchinfo
 ultralytics
 opencv-python
 lap

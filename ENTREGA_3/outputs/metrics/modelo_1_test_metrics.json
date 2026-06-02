@@ -1,0 +1,36 @@
+{
+  "model_run_name": "modelo_1",
+  "accuracy": 0.86,
+  "precision": 0.8461538461538461,
+  "recall": 0.6875,
+  "f1": 0.7586206896551724,
+  "num_test_samples": 50,
+  "model_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\models\\modelo_1_best_model.pt",
+  "last_model_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\models\\modelo_1_last_model.pt",
+  "train_history_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\metrics\\modelo_1_train_history.csv",
+  "confusion_matrix_csv_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\metrics\\modelo_1_confusion_matrix.csv",
+  "loss_curve_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\figures\\modelo_1_loss_curve.png",
+  "confusion_matrix_png_path": "c:\\Users\\franco\\Downloads\\1-INTELIGENCIA_ARTIFICIAL\\PROJECT\\ENTREGA_3\\outputs\\figures\\modelo_1_confusion_matrix.png",
+  "best_val_metrics": {
+    "accuracy": 0.9302325581395349,
+    "precision": 1.0,
+    "recall": 0.8333333333333334,
+    "f1": 0.9090909090909091,
+    "loss": 0.24110856279730797
+  },
+  "config": {
+    "description": "Base comparable: ResNet-50 preentrenada, cabeza primero y fine-tuning de layer4.",
+    "batch_size": 8,
+    "total_epochs": 15,
+    "head_epochs": 5,
+    "lr_head": 0.001,
+    "lr_finetune": 0.0001,
+    "weight_decay": 0.0001,
+    "dropout": 0.3,
+    "pretrained": true,
+    "freeze_backbone": true,
+    "unfreeze_layer4": true,
+    "early_stopping": true,
+    "early_stopping_patience": 4
+  }
+}

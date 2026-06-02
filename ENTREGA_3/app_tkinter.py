@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 import traceback
-from collections import OrderedDict
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -45,6 +45,7 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 @dataclass(frozen=True)
 class AppSettings:
     alert_threshold: float = 0.60
+    early_exit_threshold: float = 0.90
     debug_mode: bool = False
     device_name: str = "auto"
     tracker_name: str = "botsort.yaml"
@@ -63,7 +64,6 @@ class AppSettings:
     crop_height: int = 96
     cnn_image_size: int = 224
     cnn_dropout: float = 0.30
-    max_frame_cache_size: int = 64
 
 
 LogCallback = Callable[[str], None]
@@ -400,72 +400,35 @@ def build_track_windows(track_df: pd.DataFrame, settings: AppSettings) -> list[d
     return windows
 
 
-def read_frame_by_index(
-    capture: cv2.VideoCapture,
-    frame_idx: int,
-    frame_cache: OrderedDict[int, np.ndarray],
-    max_cache_size: int,
+def crop_person_from_frame(
+    frame: np.ndarray,
+    track_row: pd.Series | dict[str, object],
+    settings: AppSettings,
 ) -> np.ndarray | None:
-    if frame_idx in frame_cache:
-        frame = frame_cache.pop(frame_idx)
-        frame_cache[frame_idx] = frame
-        return frame
+    frame_height, frame_width = frame.shape[:2]
+    x1 = float(track_row["x1"])
+    y1 = float(track_row["y1"])
+    x2 = float(track_row["x2"])
+    y2 = float(track_row["y2"])
 
-    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ok, frame = capture.read()
-    if not ok or frame is None:
+    bbox_width = x2 - x1
+    bbox_height = y2 - y1
+    pad_x = bbox_width * settings.bbox_padding_ratio
+    pad_y = bbox_height * settings.bbox_padding_ratio
+
+    padded_x1 = max(0, int(round(x1 - pad_x)))
+    padded_y1 = max(0, int(round(y1 - pad_y)))
+    padded_x2 = min(frame_width, int(round(x2 + pad_x)))
+    padded_y2 = min(frame_height, int(round(y2 + pad_y)))
+
+    if padded_x2 <= padded_x1 or padded_y2 <= padded_y1:
         return None
 
-    frame_cache[frame_idx] = frame
-    if len(frame_cache) > max_cache_size:
-        frame_cache.popitem(last=False)
-    return frame
+    crop = frame[padded_y1:padded_y2, padded_x1:padded_x2]
+    if crop is None or crop.size == 0 or crop.shape[0] <= 1 or crop.shape[1] <= 1:
+        return None
 
-
-def recover_window_crops(
-    capture: cv2.VideoCapture,
-    sampled_rows_df: pd.DataFrame,
-    settings: AppSettings,
-    frame_cache: OrderedDict[int, np.ndarray],
-) -> tuple[list[np.ndarray], list[int], list[float]]:
-    crops: list[np.ndarray] = []
-    used_frame_indices: list[int] = []
-    used_timestamps: list[float] = []
-
-    for _, track_row in sampled_rows_df.iterrows():
-        frame_idx = int(track_row["frame_idx"])
-        frame = read_frame_by_index(capture, frame_idx, frame_cache, settings.max_frame_cache_size)
-        if frame is None:
-            continue
-
-        frame_height, frame_width = frame.shape[:2]
-        x1 = float(track_row["x1"])
-        y1 = float(track_row["y1"])
-        x2 = float(track_row["x2"])
-        y2 = float(track_row["y2"])
-
-        bbox_width = x2 - x1
-        bbox_height = y2 - y1
-        pad_x = bbox_width * settings.bbox_padding_ratio
-        pad_y = bbox_height * settings.bbox_padding_ratio
-
-        padded_x1 = max(0, int(round(x1 - pad_x)))
-        padded_y1 = max(0, int(round(y1 - pad_y)))
-        padded_x2 = min(frame_width, int(round(x2 + pad_x)))
-        padded_y2 = min(frame_height, int(round(y2 + pad_y)))
-
-        if padded_x2 <= padded_x1 or padded_y2 <= padded_y1:
-            continue
-
-        crop = frame[padded_y1:padded_y2, padded_x1:padded_x2]
-        if crop is None or crop.size == 0 or crop.shape[0] <= 1 or crop.shape[1] <= 1:
-            continue
-
-        crops.append(crop)
-        used_frame_indices.append(frame_idx)
-        used_timestamps.append(round(float(track_row["timestamp_sec"]), 6))
-
-    return crops, used_frame_indices, used_timestamps
+    return crop
 
 
 def build_temporal_mosaic(crops: list[np.ndarray], settings: AppSettings) -> np.ndarray:
@@ -490,6 +453,145 @@ def build_temporal_mosaic(crops: list[np.ndarray], settings: AppSettings) -> np.
         mosaic_rows.append(np.concatenate(resized_crops[start_index:end_index], axis=1))
 
     return np.concatenate(mosaic_rows, axis=0)
+
+
+def select_window_entries(
+    buffer_entries: deque[dict[str, object]],
+    start_sec: float,
+    end_sec: float,
+    settings: AppSettings,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    window_entries = [
+        entry
+        for entry in buffer_entries
+        if start_sec <= float(entry["timestamp_sec"]) <= end_sec
+    ]
+
+    if len(window_entries) <= settings.frames_per_person_window:
+        sampled_entries = sorted(window_entries, key=lambda entry: int(entry["frame_idx"]))
+        return window_entries, sampled_entries
+
+    available_entries = sorted(window_entries, key=lambda entry: float(entry["timestamp_sec"]))
+    selected_indices: list[int] = []
+    target_timestamps = np.linspace(start_sec, end_sec, num=settings.frames_per_person_window)
+
+    for target_timestamp in target_timestamps:
+        remaining_indices = [
+            index for index in range(len(available_entries)) if index not in selected_indices
+        ]
+        if not remaining_indices:
+            break
+
+        best_index = min(
+            remaining_indices,
+            key=lambda index: (
+                abs(float(available_entries[index]["timestamp_sec"]) - float(target_timestamp)),
+                int(available_entries[index]["frame_idx"]),
+            ),
+        )
+        selected_indices.append(int(best_index))
+
+    sampled_entries = sorted(
+        [available_entries[index] for index in selected_indices],
+        key=lambda entry: int(entry["frame_idx"]),
+    )
+    return window_entries, sampled_entries
+
+
+def classify_window_entries(
+    sample_id: str,
+    track_id: int,
+    window_id: str,
+    start_sec: float,
+    end_sec: float,
+    window_entries: list[dict[str, object]],
+    sampled_entries: list[dict[str, object]],
+    classifier: torch.nn.Module,
+    eval_transform: transforms.Compose,
+    index_to_class: dict[int, str],
+    device: torch.device,
+    settings: AppSettings,
+    run_dir: Path,
+    best_positive_probability: float,
+    debug: LogCallback | None = None,
+) -> tuple[dict[str, object], float, Path | None, bool]:
+    crops = [
+        entry["crop"]
+        for entry in sampled_entries
+        if isinstance(entry.get("crop"), np.ndarray)
+    ]
+    used_frame_indices = [
+        int(entry["frame_idx"])
+        for entry in sampled_entries
+        if isinstance(entry.get("crop"), np.ndarray)
+    ]
+    used_timestamps = [
+        round(float(entry["timestamp_sec"]), 6)
+        for entry in sampled_entries
+        if isinstance(entry.get("crop"), np.ndarray)
+    ]
+
+    if window_entries:
+        start_frame = int(min(int(entry["frame_idx"]) for entry in window_entries))
+        end_frame = int(max(int(entry["frame_idx"]) for entry in window_entries))
+    else:
+        start_frame = -1
+        end_frame = -1
+
+    valid_sample = len(crops) >= settings.min_valid_frames_per_window
+    positive_probability = 0.0
+    negative_probability = 0.0
+    predicted_label = NEGATIVE_LABEL
+    best_evidence_path: Path | None = None
+    high_confidence_exit = False
+
+    if valid_sample:
+        mosaic = build_temporal_mosaic(crops, settings)
+        mosaic_rgb = cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB)
+        mosaic_pil = Image.fromarray(mosaic_rgb)
+        image_tensor = eval_transform(mosaic_pil).unsqueeze(0).to(device)
+
+        with torch.inference_mode():
+            logits = classifier(image_tensor)
+            probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+
+        negative_probability = float(probabilities[LABEL_TO_INDEX[NEGATIVE_LABEL]])
+        positive_probability = float(probabilities[LABEL_TO_INDEX[POSITIVE_LABEL]])
+        predicted_index = int(np.argmax(probabilities))
+        predicted_label = index_to_class.get(predicted_index, INDEX_TO_LABEL[predicted_index])
+
+        if positive_probability >= settings.alert_threshold and positive_probability > best_positive_probability:
+            best_positive_probability = positive_probability
+            best_evidence_path = run_dir / "best_evidence.png"
+            cv2.imwrite(str(best_evidence_path), mosaic)
+            emit_debug(
+                debug,
+                (
+                    f"Nueva mejor evidencia: {sample_id}, prob_hurto={positive_probability:.4f}, "
+                    f"umbral={settings.alert_threshold:.2f}"
+                ),
+            )
+
+        high_confidence_exit = positive_probability >= settings.early_exit_threshold
+
+    prediction = {
+        "sample_id": sample_id,
+        "track_id": int(track_id),
+        "window_id": str(window_id),
+        "start_frame": int(start_frame),
+        "end_frame": int(end_frame),
+        "start_sec": round(float(start_sec), 6),
+        "end_sec": round(float(end_sec), 6),
+        "num_frames_used": int(len(crops)),
+        "valid_sample": bool(valid_sample),
+        "sampled_frame_indices": json.dumps(used_frame_indices),
+        "sampled_timestamps": json.dumps(used_timestamps),
+        "cnn_prob_normal": round(float(negative_probability), 6),
+        "cnn_prob_hurto": round(float(positive_probability), 6),
+        "predicted_label": str(predicted_label),
+        "alert_positive": bool(positive_probability >= settings.alert_threshold),
+    }
+    return prediction, best_positive_probability, best_evidence_path, high_confidence_exit
 
 
 def classify_video_windows(
@@ -539,118 +641,237 @@ def classify_video_windows(
         log("No quedaron tracks con longitud suficiente para construir ventanas.")
         return pd.DataFrame(columns=prediction_columns), None
 
-    track_windows: list[tuple[int, list[dict[str, object]]]] = []
+    track_window_counts: dict[int, int] = {}
+    track_start_by_id: dict[int, float] = {}
+    track_end_by_id: dict[int, float] = {}
     total_windows = 0
     for track_id, track_df in filtered_tracks_df.groupby("track_id"):
         windows = build_track_windows(track_df, settings)
-        track_windows.append((int(track_id), windows))
+        int_track_id = int(track_id)
+        track_window_counts[int_track_id] = len(windows)
+        track_start_by_id[int_track_id] = round(float(track_df["timestamp_sec"].min()), 6)
+        track_end_by_id[int_track_id] = round(float(track_df["timestamp_sec"].max()), 6)
         total_windows += len(windows)
 
     emit_debug(
         debug,
-        f"Clasificacion: tracks validos={len(track_windows)}, ventanas totales={total_windows}, dispositivo={device}",
+        (
+            f"Clasificacion rolling buffer: tracks validos={len(track_window_counts)}, "
+            f"ventanas planificadas={total_windows}, dispositivo={device}"
+        ),
     )
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"No se pudo abrir el video para clasificar ventanas: {video_path}")
 
-    frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+    frame_lookup = {
+        int(frame_idx): frame_rows.to_dict(orient="records")
+        for frame_idx, frame_rows in filtered_tracks_df.groupby("frame_idx")
+    }
+    track_buffers: dict[int, deque[dict[str, object]]] = {
+        int(track_id): deque() for track_id in track_window_counts
+    }
+    next_window_start_by_track = dict(track_start_by_id)
+    window_counter_by_track = {int(track_id): 0 for track_id in track_window_counts}
+    closed_tracks: set[int] = set()
     predictions: list[dict[str, object]] = []
     best_positive_probability = -1.0
     best_evidence_path: Path | None = None
     video_id = video_path.stem
     processed_windows = 0
+    skipped_windows = 0
+    frame_idx = 0
 
     try:
-        for track_id, windows in track_windows:
-            emit_debug(debug, f"Clasificando track {track_id} con {len(windows)} ventanas.")
-            for window_spec in windows:
-                sampled_rows_df = window_spec["sampled_rows_df"]
-                sample_id = f"{video_id}__t{int(track_id)}__{window_spec['window_id']}"
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
 
-                crops, used_frame_indices, used_timestamps = recover_window_crops(
-                    capture=capture,
-                    sampled_rows_df=sampled_rows_df,
-                    settings=settings,
-                    frame_cache=frame_cache,
-                )
+            for row in frame_lookup.get(frame_idx, []):
+                track_id = int(row["track_id"])
+                if track_id in closed_tracks:
+                    continue
 
-                valid_sample = len(crops) >= settings.min_valid_frames_per_window
-                positive_probability = 0.0
-                negative_probability = 0.0
-                predicted_label = NEGATIVE_LABEL
+                crop = crop_person_from_frame(frame, row, settings)
+                entry = {
+                    "frame_idx": int(row["frame_idx"]),
+                    "timestamp_sec": round(float(row["timestamp_sec"]), 6),
+                    "crop": crop,
+                }
+                track_buffer = track_buffers[track_id]
+                track_buffer.append(entry)
 
-                if valid_sample:
-                    mosaic = build_temporal_mosaic(crops, settings)
-                    mosaic_rgb = cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB)
-                    mosaic_pil = Image.fromarray(mosaic_rgb)
-                    image_tensor = eval_transform(mosaic_pil).unsqueeze(0).to(device)
+                while (
+                    window_counter_by_track[track_id] < track_window_counts[track_id]
+                    and float(row["timestamp_sec"])
+                    >= next_window_start_by_track[track_id] + settings.person_window_seconds
+                ):
+                    window_start_sec = next_window_start_by_track[track_id]
+                    window_end_sec = round(float(window_start_sec + settings.person_window_seconds), 6)
+                    window_number = window_counter_by_track[track_id]
+                    window_id = f"w{window_number:04d}"
+                    sample_id = f"{video_id}__t{track_id}__{window_id}"
+                    window_entries, sampled_entries = select_window_entries(
+                        track_buffer,
+                        window_start_sec,
+                        window_end_sec,
+                        settings,
+                    )
+                    (
+                        prediction,
+                        best_positive_probability,
+                        new_best_evidence_path,
+                        high_confidence_exit,
+                    ) = classify_window_entries(
+                        sample_id=sample_id,
+                        track_id=track_id,
+                        window_id=window_id,
+                        start_sec=window_start_sec,
+                        end_sec=window_end_sec,
+                        window_entries=window_entries,
+                        sampled_entries=sampled_entries,
+                        classifier=classifier,
+                        eval_transform=eval_transform,
+                        index_to_class=index_to_class,
+                        device=device,
+                        settings=settings,
+                        run_dir=run_dir,
+                        best_positive_probability=best_positive_probability,
+                        debug=debug,
+                    )
+                    if new_best_evidence_path is not None:
+                        best_evidence_path = new_best_evidence_path
 
-                    with torch.inference_mode():
-                        logits = classifier(image_tensor)
-                        probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+                    predictions.append(prediction)
+                    processed_windows += 1
+                    window_counter_by_track[track_id] += 1
+                    next_window_start_by_track[track_id] = round(
+                        float(next_window_start_by_track[track_id] + settings.person_window_stride_seconds),
+                        6,
+                    )
 
-                    negative_probability = float(probabilities[LABEL_TO_INDEX[NEGATIVE_LABEL]])
-                    positive_probability = float(probabilities[LABEL_TO_INDEX[POSITIVE_LABEL]])
-                    predicted_index = int(np.argmax(probabilities))
-                    predicted_label = index_to_class.get(predicted_index, INDEX_TO_LABEL[predicted_index])
+                    if total_windows > 0:
+                        emit_stage_progress(
+                            progress,
+                            0.0,
+                            1.0,
+                            processed_windows / total_windows,
+                            "Clasificando ventanas",
+                            f"Ventanas procesadas: {processed_windows}/{total_windows}",
+                        )
 
-                    if positive_probability >= settings.alert_threshold and positive_probability > best_positive_probability:
-                        best_positive_probability = positive_probability
-                        best_evidence_path = run_dir / "best_evidence.png"
-                        cv2.imwrite(str(best_evidence_path), mosaic)
+                    if settings.debug_mode and (
+                        processed_windows == 1
+                        or processed_windows == total_windows
+                        or processed_windows % max(1, total_windows // 20) == 0
+                    ):
                         emit_debug(
                             debug,
                             (
-                                f"Nueva mejor evidencia: {sample_id}, prob_hurto={positive_probability:.4f}, "
-                                f"umbral={settings.alert_threshold:.2f}"
+                                f"Ventana {sample_id}: valid_sample={prediction['valid_sample']}, "
+                                f"prob_hurto={float(prediction['cnn_prob_hurto']):.4f}, "
+                                f"prob_normal={float(prediction['cnn_prob_normal']):.4f}"
                             ),
                         )
 
-                predictions.append(
-                    {
-                        "sample_id": sample_id,
-                        "track_id": int(track_id),
-                        "window_id": str(window_spec["window_id"]),
-                        "start_frame": int(window_spec["start_frame"]),
-                        "end_frame": int(window_spec["end_frame"]),
-                        "start_sec": round(float(window_spec["start_sec"]), 6),
-                        "end_sec": round(float(window_spec["end_sec"]), 6),
-                        "num_frames_used": int(len(crops)),
-                        "valid_sample": bool(valid_sample),
-                        "sampled_frame_indices": json.dumps(used_frame_indices),
-                        "sampled_timestamps": json.dumps(used_timestamps),
-                        "cnn_prob_normal": round(float(negative_probability), 6),
-                        "cnn_prob_hurto": round(float(positive_probability), 6),
-                        "predicted_label": str(predicted_label),
-                        "alert_positive": bool(positive_probability >= settings.alert_threshold),
-                    }
+                    while (
+                        track_buffer
+                        and float(track_buffer[0]["timestamp_sec"])
+                        < next_window_start_by_track[track_id] - 1e-9
+                    ):
+                        track_buffer.popleft()
+
+                    if high_confidence_exit:
+                        remaining_track_windows = (
+                            track_window_counts[track_id] - window_counter_by_track[track_id]
+                        )
+                        skipped_windows += remaining_track_windows
+                        processed_windows += remaining_track_windows
+                        closed_tracks.add(track_id)
+                        track_buffer.clear()
+                        emit_debug(
+                            debug,
+                            (
+                                f"Early exit track {track_id}: "
+                                f"prob_hurto={float(prediction['cnn_prob_hurto']):.4f}, "
+                                f"umbral_alto={settings.early_exit_threshold:.2f}, "
+                                f"ventanas_omitidas={remaining_track_windows}"
+                            ),
+                        )
+                        if total_windows > 0:
+                            emit_stage_progress(
+                                progress,
+                                0.0,
+                                1.0,
+                                processed_windows / total_windows,
+                                "Clasificando ventanas",
+                                f"Ventanas procesadas: {processed_windows}/{total_windows}",
+                            )
+                        break
+
+            frame_idx += 1
+
+        for track_id, track_buffer in track_buffers.items():
+            if track_id in closed_tracks or window_counter_by_track[track_id] > 0:
+                continue
+
+            track_duration_sec = track_end_by_id[track_id] - track_start_by_id[track_id]
+            if track_duration_sec > settings.person_window_seconds:
+                continue
+
+            window_id = "w0000"
+            sample_id = f"{video_id}__t{track_id}__{window_id}"
+            window_start_sec = track_start_by_id[track_id]
+            window_end_sec = track_end_by_id[track_id]
+            window_entries, sampled_entries = select_window_entries(
+                track_buffer,
+                window_start_sec,
+                window_end_sec,
+                settings,
+            )
+            (
+                prediction,
+                best_positive_probability,
+                new_best_evidence_path,
+                _high_confidence_exit,
+            ) = classify_window_entries(
+                sample_id=sample_id,
+                track_id=track_id,
+                window_id=window_id,
+                start_sec=window_start_sec,
+                end_sec=window_end_sec,
+                window_entries=window_entries,
+                sampled_entries=sampled_entries,
+                classifier=classifier,
+                eval_transform=eval_transform,
+                index_to_class=index_to_class,
+                device=device,
+                settings=settings,
+                run_dir=run_dir,
+                best_positive_probability=best_positive_probability,
+                debug=debug,
+            )
+            if new_best_evidence_path is not None:
+                best_evidence_path = new_best_evidence_path
+            predictions.append(prediction)
+            processed_windows += 1
+            window_counter_by_track[track_id] += 1
+            if total_windows > 0:
+                emit_stage_progress(
+                    progress,
+                    0.0,
+                    1.0,
+                    processed_windows / total_windows,
+                    "Clasificando ventanas",
+                    f"Ventanas procesadas: {processed_windows}/{total_windows}",
                 )
-                processed_windows += 1
-                if total_windows > 0:
-                    emit_stage_progress(
-                        progress,
-                        0.0,
-                        1.0,
-                        processed_windows / total_windows,
-                        "Clasificando ventanas",
-                        f"Ventanas procesadas: {processed_windows}/{total_windows}",
-                    )
-                if settings.debug_mode and (
-                    processed_windows == 1
-                    or processed_windows == total_windows
-                    or processed_windows % max(1, total_windows // 20) == 0
-                ):
-                    emit_debug(
-                        debug,
-                        (
-                            f"Ventana {sample_id}: valid_sample={valid_sample}, "
-                            f"prob_hurto={positive_probability:.4f}, prob_normal={negative_probability:.4f}"
-                        ),
-                    )
     finally:
         capture.release()
+
+    if skipped_windows > 0:
+        log(f"Early exit activo: se omitieron {skipped_windows} ventanas posteriores a alertas de alta confianza.")
 
     predictions_df = pd.DataFrame(predictions, columns=prediction_columns)
     if not predictions_df.empty:
@@ -783,12 +1004,16 @@ def render_annotated_video(
 def analyze_video(
     video_path: Path,
     settings: AppSettings,
+    yolo_model: YOLO,
+    classifier: torch.nn.Module,
+    eval_transform: transforms.Compose,
+    index_to_class: dict[int, str],
+    device: torch.device,
     log: LogCallback,
     progress: ProgressCallback | None = None,
     debug: LogCallback | None = None,
 ) -> dict[str, object]:
     run_dir = build_run_dir(video_path)
-    device = resolve_device(settings.device_name)
 
     emit_progress(progress, 0.02, "Preparando analisis", f"Creando salida para {video_path.name}")
     log(f"Video seleccionado: {video_path}")
@@ -804,15 +1029,7 @@ def analyze_video(
         ),
     )
 
-    emit_progress(progress, 0.08, "Cargando modelos", "Inicializando detector y clasificador")
-    yolo_model = load_yolo_model(YOLO_MODEL_PATH, log)
-    emit_progress(progress, 0.14, "Cargando modelos", "Detector YOLO listo")
-    classifier, eval_transform, index_to_class = load_classifier(
-        checkpoint_path=CNN_CHECKPOINT_PATH,
-        device=device,
-        dropout=settings.cnn_dropout,
-        image_size=settings.cnn_image_size,
-    )
+    emit_progress(progress, 0.14, "Modelos listos", "Usando modelos cargados en memoria")
     emit_debug(debug, f"Clases del clasificador: {index_to_class}")
     emit_progress(progress, 0.20, "Modelos cargados", "Comenzando tracking de personas")
     log(f"Checkpoint de clasificación cargado: {CNN_CHECKPOINT_PATH}")
@@ -984,6 +1201,14 @@ class TheftDetectionApp:
         self.worker_thread: threading.Thread | None = None
         self.last_result: dict[str, object] | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self._model_cache_key: tuple[str, float, int] | None = None
+        self._model_cache: tuple[
+            YOLO,
+            torch.nn.Module,
+            transforms.Compose,
+            dict[int, str],
+            torch.device,
+        ] | None = None
 
         self._build_ui()
         self.root.after(150, self._poll_worker_queue)
@@ -1153,6 +1378,31 @@ class TheftDetectionApp:
                 detail=f"Archivo listo: {selected_video_path}",
             )
 
+    def _get_models(
+        self,
+        settings: AppSettings,
+        log: LogCallback,
+    ) -> tuple[YOLO, torch.nn.Module, transforms.Compose, dict[int, str], torch.device]:
+        device = resolve_device(settings.device_name)
+        cache_key = (str(device), float(settings.cnn_dropout), int(settings.cnn_image_size))
+
+        if self._model_cache is not None and self._model_cache_key == cache_key:
+            log("Modelos reutilizados desde memoria.")
+            return self._model_cache
+
+        log("Cargando modelos en memoria.")
+        yolo_model = load_yolo_model(YOLO_MODEL_PATH, log)
+        classifier, eval_transform, index_to_class = load_classifier(
+            checkpoint_path=CNN_CHECKPOINT_PATH,
+            device=device,
+            dropout=settings.cnn_dropout,
+            image_size=settings.cnn_image_size,
+        )
+        self._model_cache_key = cache_key
+        self._model_cache = (yolo_model, classifier, eval_transform, index_to_class, device)
+        log("Modelos cargados y guardados para reutilizar durante esta sesion.")
+        return self._model_cache
+
     def _start_analysis(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showinfo("Análisis en curso", "Espera a que termine el procesamiento actual.")
@@ -1194,25 +1444,35 @@ class TheftDetectionApp:
 
         def worker() -> None:
             try:
+                worker_log = lambda message: self.worker_queue.put(("log", message))
+                worker_progress = lambda value, stage, detail: self.worker_queue.put(
+                    (
+                        "progress",
+                        {
+                            "value": float(value),
+                            "stage": str(stage),
+                            "detail": str(detail),
+                        },
+                    )
+                )
+                worker_debug = (
+                    (lambda message: self.worker_queue.put(("debug", message)))
+                    if settings.debug_mode
+                    else None
+                )
+                worker_progress(0.01, "Cargando modelos", "Inicializando modelos si no estan en memoria")
+                yolo_model, classifier, eval_transform, index_to_class, device = self._get_models(settings, worker_log)
                 result = analyze_video(
                     video_path=video_path,
                     settings=settings,
-                    log=lambda message: self.worker_queue.put(("log", message)),
-                    progress=lambda value, stage, detail: self.worker_queue.put(
-                        (
-                            "progress",
-                            {
-                                "value": float(value),
-                                "stage": str(stage),
-                                "detail": str(detail),
-                            },
-                        )
-                    ),
-                    debug=(
-                        (lambda message: self.worker_queue.put(("debug", message)))
-                        if settings.debug_mode
-                        else None
-                    ),
+                    yolo_model=yolo_model,
+                    classifier=classifier,
+                    eval_transform=eval_transform,
+                    index_to_class=index_to_class,
+                    device=device,
+                    log=worker_log,
+                    progress=worker_progress,
+                    debug=worker_debug,
                 )
                 self.worker_queue.put(("done", result))
             except Exception as error:  # noqa: BLE001
