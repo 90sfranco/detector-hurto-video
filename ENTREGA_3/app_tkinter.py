@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -18,14 +20,20 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from PIL import Image, ImageTk
+import tkinter as tk
 from tkinter import BOTH, END, LEFT, RIGHT, W, filedialog, messagebox, ttk
-from tkinter import BooleanVar, Frame, Label, StringVar, Tk
+from tkinter import BooleanVar, Frame, Label, StringVar, Tk, Toplevel
 from tkinter.scrolledtext import ScrolledText
 from ultralytics import YOLO
 from ultralytics.utils.downloads import attempt_download_asset
 from torchvision import transforms
 from torchvision.models import resnet50
 from torchvision.transforms import InterpolationMode
+
+try:
+    import winsound
+except ImportError:  # pragma: no cover - winsound solo existe en Windows.
+    winsound = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -40,6 +48,21 @@ INDEX_TO_LABEL = {value: key for key, value in LABEL_TO_INDEX.items()}
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+SENSITIVITY_LEVELS = {
+    "Alta": {
+        "threshold": 0.45,
+        "description": "Detecta mas eventos, puede generar mas alertas.",
+    },
+    "Media": {
+        "threshold": 0.60,
+        "description": "Equilibrado, recomendado.",
+    },
+    "Baja": {
+        "threshold": 0.80,
+        "description": "Solo marca los casos mas evidentes.",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -951,10 +974,10 @@ def render_annotated_video(
                 if positive_probability is not None:
                     frame_has_alert = True
                     color = (0, 0, 255)
-                    label = f"Posible hurto {positive_probability:.2f}"
+                    label = "Posible hurto"
                 else:
                     color = (0, 180, 0)
-                    label = f"Persona {track_id}"
+                    label = "Persona"
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(
@@ -969,13 +992,14 @@ def render_annotated_video(
                 )
 
         if frame_has_alert:
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 45), (0, 0, 180), -1)
+            timestamp_text = f"Tiempo: {format_seconds(frame_idx / fps)}"
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 48), (0, 0, 180), -1)
             cv2.putText(
                 frame,
-                "ALERTA: posible hurto detectado",
+                f"ALERTA: posible hurto detectado   {timestamp_text}",
                 (12, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                0.85,
                 (255, 255, 255),
                 2,
                 cv2.LINE_AA,
@@ -1091,6 +1115,8 @@ def analyze_video(
                 [
                     "sample_id",
                     "track_id",
+                    "start_frame",
+                    "end_frame",
                     "start_sec",
                     "end_sec",
                     "cnn_prob_hurto",
@@ -1098,6 +1124,8 @@ def analyze_video(
             ]
             .to_dict(orient="records")
         )
+
+    mosaic_evidence_path = best_evidence_path if top_events else None
 
     summary = {
         "video_path": str(video_path),
@@ -1115,6 +1143,8 @@ def analyze_video(
         "clean_tracks_path": str(clean_tracks_path),
         "window_predictions_path": str(run_dir / "window_predictions.csv"),
         "best_evidence_path": str(best_evidence_path) if best_evidence_path is not None else "",
+        "mosaic_evidence_path": str(mosaic_evidence_path) if mosaic_evidence_path is not None else "",
+        "incident_evidence_path": str(mosaic_evidence_path) if mosaic_evidence_path is not None else "",
         "models_used": {
             "person_detector_path": str(YOLO_MODEL_PATH),
             "person_detector_type": "pretrained_yolo_person_detector",
@@ -1124,6 +1154,8 @@ def analyze_video(
         "debug_mode": bool(settings.debug_mode),
         "top_events": top_events,
     }
+    report_path = write_user_report(summary, run_dir)
+    summary["incident_report_path"] = str(report_path)
 
     summary_path = run_dir / "analysis_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1144,37 +1176,147 @@ def open_path(path: Path) -> None:
     subprocess.Popen(["xdg-open", str(path)])
 
 
-def load_video_preview_image(video_path: Path) -> Image.Image:
-    capture = cv2.VideoCapture(str(video_path))
+def format_seconds(seconds: float) -> str:
+    bounded_seconds = max(0, int(round(float(seconds))))
+    minutes, remaining_seconds = divmod(bounded_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def suspicion_level(probability: float) -> str:
+    if probability >= 0.85:
+        return "Alta"
+    if probability >= 0.60:
+        return "Media"
+    return "Baja"
+
+
+def save_annotated_evidence_frame(
+    annotated_video_path: Path,
+    frame_idx: int,
+    output_path: Path,
+) -> Path | None:
+    capture = cv2.VideoCapture(str(annotated_video_path))
     if not capture.isOpened():
-        raise RuntimeError(f"No se pudo abrir el video para generar la vista previa: {video_path}")
+        return None
 
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    candidate_indices = [0]
-    if frame_count > 1:
-        candidate_indices.append(min(frame_count - 1, max(0, frame_count // 3)))
-    if frame_count > 2:
-        candidate_indices.append(min(frame_count - 1, max(0, frame_count // 2)))
-
-    selected_frame: np.ndarray | None = None
     try:
-        for frame_idx in candidate_indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame = capture.read()
-            if not ok or frame is None or frame.size == 0:
-                continue
-
-            selected_frame = frame
-            if float(frame.mean()) > 5.0:
-                break
+        capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx)))
+        ok, frame = capture.read()
+        if not ok or frame is None or frame.size == 0:
+            return None
+        cv2.imwrite(str(output_path), frame)
+        return output_path
     finally:
         capture.release()
 
-    if selected_frame is None:
-        raise RuntimeError(f"No fue posible leer frames validos de {video_path}")
 
-    frame_rgb = cv2.cvtColor(selected_frame, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(frame_rgb)
+def write_user_report(summary: dict[str, object], run_dir: Path) -> Path:
+    video_alert = bool(summary.get("video_alert"))
+    report_prefix = "Incidente_Hurto" if video_alert else "Revision_Sin_Alerta"
+    report_path = run_dir / f"{report_prefix}_{time.strftime('%Y-%m-%d_%H-%M-%S')}.html"
+    top_events = summary.get("top_events", [])
+    top_event = top_events[0] if isinstance(top_events, list) and top_events else None
+
+    if isinstance(top_event, dict):
+        event_time = f"{format_seconds(float(top_event['start_sec']))} - {format_seconds(float(top_event['end_sec']))}"
+        event_level = suspicion_level(float(top_event["cnn_prob_hurto"]))
+        event_probability = f"{float(top_event['cnn_prob_hurto']) * 100:.1f}%"
+        event_text = (
+            f"Persona/track {int(top_event['track_id'])} entre {event_time}. "
+            f"Nivel de sospecha: {event_level}. Probabilidad hurto: {event_probability}."
+        )
+    else:
+        event_time = "Sin alerta"
+        event_level = "N/A"
+        event_probability = "N/A"
+        event_text = "No se registraron eventos sospechosos sobre la sensibilidad seleccionada."
+
+    evidence_path = str(
+        summary.get("mosaic_evidence_path")
+        or summary.get("best_evidence_path")
+        or summary.get("incident_evidence_path")
+        or ""
+    )
+    evidence_uri = Path(evidence_path).resolve().as_uri() if evidence_path else ""
+    annotated_video_path = str(summary.get("annotated_video_path", ""))
+    annotated_video_uri = Path(annotated_video_path).resolve().as_uri() if annotated_video_path else ""
+    source_video_path = str(summary.get("video_path", ""))
+
+    escaped_event_text = html.escape(event_text)
+    escaped_source_video_path = html.escape(source_video_path)
+    escaped_annotated_video_path = html.escape(annotated_video_path)
+    escaped_evidence_path = html.escape(evidence_path)
+    escaped_event_time = html.escape(event_time)
+    escaped_event_level = html.escape(event_level)
+    escaped_event_probability = html.escape(event_probability)
+    escaped_threshold = html.escape(f"{float(summary.get('alert_threshold', 0.0)):.2f}")
+    escaped_run_dir = html.escape(str(summary.get("run_dir", "")))
+
+    save_links = []
+    if annotated_video_uri:
+        save_links.append(
+            f'<a class="button" href="{html.escape(annotated_video_uri)}" download>Guardar video anotado</a>'
+        )
+    if evidence_uri:
+        save_links.append(
+            f'<a class="button" href="{html.escape(evidence_uri)}" download>Guardar mosaico</a>'
+        )
+    save_links_html = "\n    ".join(save_links) if save_links else "<span>No hay archivos de evidencia para guardar.</span>"
+    evidence_html = (
+        f'<h2>Evidencia</h2><p>Mosaico temporal usado por el modelo para generar la alerta.</p>'
+        f'<img src="{html.escape(evidence_uri)}" alt="Mosaico de evidencia">'
+        if evidence_uri
+        else ""
+    )
+
+    html_content = f"""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>{report_prefix}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 32px; color: #111827; line-height: 1.45; }}
+    h1 {{ margin-bottom: 4px; }}
+    h2 {{ margin-top: 28px; }}
+    .status {{ padding: 12px 16px; border-radius: 8px; color: white; background: {'#991b1b' if video_alert else '#14532d'}; }}
+    .grid {{ display: grid; grid-template-columns: 190px 1fr; gap: 8px 16px; margin-top: 24px; }}
+    img {{ max-width: 620px; width: 100%; image-rendering: auto; border: 1px solid #d1d5db; margin-top: 12px; }}
+    a {{ color: #1d4ed8; }}
+    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
+    .button {{ display: inline-block; padding: 10px 14px; border-radius: 6px; background: #111827; color: white; text-decoration: none; }}
+    .note {{ color: #4b5563; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h1>{'Informe de incidente' if video_alert else 'Informe de revision'}</h1>
+  <p>{time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+  <div class="status">{'Posible hurto detectado' if video_alert else 'No se detecto alerta'}</div>
+  <div class="grid">
+    <strong>Video revisado</strong><span>{escaped_source_video_path}</span>
+    <strong>Resultado</strong><span>{escaped_event_text}</span>
+    <strong>Momento</strong><span>{escaped_event_time}</span>
+    <strong>Nivel</strong><span>{escaped_event_level}</span>
+    <strong>Probabilidad hurto</strong><span>{escaped_event_probability}</span>
+    <strong>Umbral usado</strong><span>{escaped_threshold}</span>
+    <strong>Video anotado</strong><span><a href="{html.escape(annotated_video_uri)}">{escaped_annotated_video_path}</a></span>
+    <strong>Mosaico</strong><span>{escaped_evidence_path}</span>
+    <strong>Carpeta salida</strong><span>{escaped_run_dir}</span>
+  </div>
+  {evidence_html}
+  <h2>Guardar archivos</h2>
+  <p class="note">Opcional: usa estos enlaces para guardar el video anotado y el mosaico en una ubicacion del equipo.</p>
+  <div class="actions">
+    {save_links_html}
+  </div>
+</body>
+</html>
+"""
+    report_path.write_text(html_content, encoding="utf-8")
+    return report_path
+
 
 
 class TheftDetectionApp:
@@ -1185,12 +1327,8 @@ class TheftDetectionApp:
         self.root.minsize(1080, 700)
 
         self.video_path_var = StringVar()
-        self.threshold_var = StringVar(value="0.60")
-        self.debug_var = BooleanVar(value=True)
-        self.preview_caption_var = StringVar(value="Vista previa")
-        self.preview_detail_var = StringVar(
-            value="Selecciona un video para revisar la escena antes de ejecutar el analisis."
-        )
+        self.sensitivity_var = StringVar(value="Media")
+        self.debug_var = BooleanVar(value=False)
         self.status_var = StringVar(value="Selecciona un video y ejecuta el análisis.")
         self.summary_var = StringVar(value="Sin resultados todavía.")
 
@@ -1200,7 +1338,11 @@ class TheftDetectionApp:
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.last_result: dict[str, object] | None = None
-        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.evidence_window: Toplevel | None = None
+        self.evidence_photo: ImageTk.PhotoImage | None = None
+        self.advanced_visible = False
+        self.alert_sound_stop_event = threading.Event()
+        self.alert_sound_thread: threading.Thread | None = None
         self._model_cache_key: tuple[str, float, int] | None = None
         self._model_cache: tuple[
             YOLO,
@@ -1211,13 +1353,14 @@ class TheftDetectionApp:
         ] | None = None
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(150, self._poll_worker_queue)
 
     def _build_ui(self) -> None:
         root_frame = ttk.Frame(self.root, padding=14)
         root_frame.pack(fill=BOTH, expand=True)
 
-        controls_frame = ttk.LabelFrame(root_frame, text="Entrada", padding=12)
+        controls_frame = ttk.LabelFrame(root_frame, text="Revision de video", padding=12)
         controls_frame.pack(fill="x")
 
         ttk.Label(controls_frame, text="Video").grid(row=0, column=0, sticky=W)
@@ -1227,37 +1370,29 @@ class TheftDetectionApp:
         select_button = ttk.Button(controls_frame, text="Seleccionar video", command=self._select_video)
         select_button.grid(row=0, column=2, padx=(0, 8))
 
-        ttk.Label(controls_frame, text="Umbral hurto").grid(row=1, column=0, pady=(12, 0), sticky=W)
-        threshold_entry = ttk.Entry(controls_frame, textvariable=self.threshold_var, width=10)
-        threshold_entry.grid(row=1, column=1, pady=(12, 0), sticky=W)
+        ttk.Label(controls_frame, text="Sensibilidad").grid(row=1, column=0, pady=(12, 0), sticky=W)
+        sensitivity_combo = ttk.Combobox(
+            controls_frame,
+            textvariable=self.sensitivity_var,
+            values=list(SENSITIVITY_LEVELS.keys()),
+            width=14,
+            state="readonly",
+        )
+        sensitivity_combo.grid(row=1, column=1, pady=(12, 0), sticky=W)
 
-        self.analyze_button = ttk.Button(controls_frame, text="Analizar video", command=self._start_analysis)
+        self.analyze_button = ttk.Button(controls_frame, text="Analizar", command=self._start_analysis)
         self.analyze_button.grid(row=1, column=2, padx=(0, 8), pady=(12, 0), sticky="e")
 
         self.open_result_button = ttk.Button(
             controls_frame,
-            text="Abrir video anotado",
-            command=self._open_annotated_video,
+            text="Ver evidencia",
+            command=self._open_evidence_view,
             state="disabled",
         )
         self.open_result_button.grid(row=1, column=3, pady=(12, 0), sticky="e")
 
-        self.open_folder_button = ttk.Button(
-            controls_frame,
-            text="Abrir carpeta",
-            command=self._open_run_folder,
-            state="disabled",
-        )
-        self.open_folder_button.grid(row=1, column=4, pady=(12, 0), sticky="e")
-
-        self.debug_check = ttk.Checkbutton(
-            controls_frame,
-            text="Modo debug",
-            variable=self.debug_var,
-        )
-        self.debug_check.grid(row=1, column=5, padx=(12, 0), pady=(12, 0), sticky="w")
-
         controls_frame.columnconfigure(1, weight=1)
+        self.root.bind("<Control-d>", self._toggle_advanced_panel)
 
         status_frame = ttk.Frame(root_frame, padding=(0, 12, 0, 12))
         status_frame.pack(fill="x")
@@ -1307,50 +1442,46 @@ class TheftDetectionApp:
         )
         self.alert_detail_label.pack(fill="x", anchor=W, pady=(6, 0))
 
-        content_frame = ttk.Frame(root_frame)
-        content_frame.pack(fill=BOTH, expand=True)
+        self.alert_actions_frame = Frame(self.alert_box, bg="#1f2937")
+        self.alert_actions_frame.pack(fill="x", pady=(10, 0))
+        self.stop_sound_button = ttk.Button(
+            self.alert_actions_frame,
+            text="Detener sonido",
+            command=self._stop_alert_sound,
+            state="disabled",
+        )
+        self.stop_sound_button.pack(anchor=W)
 
-        left_frame = ttk.LabelFrame(content_frame, text="Eventos detectados", padding=10)
-        left_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
+        timeline_frame = ttk.LabelFrame(root_frame, text="Linea de tiempo", padding=10)
+        timeline_frame.pack(fill=BOTH, expand=True)
 
         self.events_tree = ttk.Treeview(
-            left_frame,
-            columns=("track_id", "intervalo", "probabilidad"),
+            timeline_frame,
+            columns=("persona", "momento", "nivel"),
             show="headings",
             height=14,
         )
-        self.events_tree.heading("track_id", text="Track")
-        self.events_tree.heading("intervalo", text="Intervalo (s)")
-        self.events_tree.heading("probabilidad", text="Prob. hurto")
-        self.events_tree.column("track_id", width=80, anchor="center")
-        self.events_tree.column("intervalo", width=180, anchor="center")
-        self.events_tree.column("probabilidad", width=120, anchor="center")
+        self.events_tree.heading("persona", text="Persona")
+        self.events_tree.heading("momento", text="Momento")
+        self.events_tree.heading("nivel", text="Nivel")
+        self.events_tree.column("persona", width=120, anchor="center")
+        self.events_tree.column("momento", width=180, anchor="center")
+        self.events_tree.column("nivel", width=140, anchor="center")
+        self.events_tree.tag_configure("Alta", background="#fee2e2", foreground="#991b1b")
+        self.events_tree.tag_configure("Media", background="#fef3c7", foreground="#92400e")
+        self.events_tree.tag_configure("Baja", background="#dcfce7", foreground="#14532d")
         self.events_tree.pack(fill=BOTH, expand=True)
 
-        logs_frame = ttk.LabelFrame(left_frame, text="Registro", padding=8)
-        logs_frame.pack(fill=BOTH, expand=True, pady=(10, 0))
-
-        self.log_text = ScrolledText(logs_frame, height=15, wrap="word")
-        self.log_text.pack(fill=BOTH, expand=True)
-
-        right_frame = ttk.LabelFrame(content_frame, text="Vista y evidencia", padding=10)
-        right_frame.pack(side=RIGHT, fill=BOTH, expand=True)
-
-        ttk.Label(right_frame, textvariable=self.preview_caption_var, font=("Segoe UI", 11, "bold")).pack(anchor=W)
-
-        self.preview_label = ttk.Label(
-            right_frame,
-            text="La mejor evidencia positiva aparecerá aquí.\nSi no hay alerta, se mostrará el resumen en texto.",
-            anchor="center",
-            justify="center",
+        self.advanced_frame = ttk.LabelFrame(root_frame, text="Configuracion avanzada", padding=10)
+        self.debug_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Mostrar registro tecnico",
+            variable=self.debug_var,
         )
-        self.preview_label.pack(fill=BOTH, expand=True, pady=(10, 0))
-        ttk.Label(
-            right_frame,
-            textvariable=self.preview_detail_var,
-            wraplength=460,
-            justify="left",
-        ).pack(fill="x", pady=(10, 0))
+        self.debug_check.pack(anchor=W)
+        self.log_text = ScrolledText(self.advanced_frame, height=8, wrap="word")
+        self.log_text.pack(fill=BOTH, expand=True, pady=(8, 0))
+
         self._update_progress(0.0, "En espera", "Selecciona un video para comenzar.")
         self._set_alert_panel("idle")
 
@@ -1371,11 +1502,6 @@ class TheftDetectionApp:
             self._set_alert_panel(
                 "idle",
                 detail=f"Video seleccionado: {selected_video_path.name}. Ejecuta el analisis para validar posibles hurtos.",
-            )
-            self._show_video_preview(
-                selected_video_path,
-                caption="Vista previa del video seleccionado",
-                detail=f"Archivo listo: {selected_video_path}",
             )
 
     def _get_models(
@@ -1413,29 +1539,22 @@ class TheftDetectionApp:
             messagebox.showerror("Video no encontrado", "Selecciona un archivo de video válido.")
             return
 
-        try:
-            alert_threshold = float(self.threshold_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Umbral inválido", "El umbral debe ser un número decimal.")
-            return
-
-        if not 0.0 <= alert_threshold <= 1.0:
-            messagebox.showerror("Umbral inválido", "El umbral debe estar entre 0 y 1.")
-            return
+        sensitivity_name = self.sensitivity_var.get()
+        sensitivity_settings = SENSITIVITY_LEVELS.get(sensitivity_name, SENSITIVITY_LEVELS["Media"])
+        alert_threshold = float(sensitivity_settings["threshold"])
 
         self._clear_previous_result()
         self.status_var.set("Procesando video. Esto puede tardar algunos minutos.")
         self.summary_var.set("Análisis en ejecución.")
         self.analyze_button.configure(state="disabled")
         self.open_result_button.configure(state="disabled")
-        self.open_folder_button.configure(state="disabled")
         self.debug_check.configure(state="disabled")
         self._set_alert_panel(
             "running",
-            detail=f"Procesando {video_path.name}. El modelo esta revisando personas, tracks y ventanas temporales.",
+            detail=f"Procesando {video_path.name}. Sensibilidad: {sensitivity_name.lower()}.",
         )
-        self.preview_detail_var.set("Analisis en curso. La evidencia o la vista previa se actualizara al finalizar.")
         self._update_progress(0.0, "Preparando analisis", f"Inicializando procesamiento para {video_path.name}")
+        self.events_tree.insert("", END, values=("Video", "En proceso", "Analizando"))
 
         settings = AppSettings(
             alert_threshold=alert_threshold,
@@ -1509,10 +1628,27 @@ class TheftDetectionApp:
 
     def _update_progress(self, value: float, stage: str, detail: str) -> None:
         bounded_value = max(0.0, min(1.0, float(value)))
+        friendly_stage, friendly_detail = self._friendly_progress_text(stage, detail)
         self.progress_bar.configure(value=bounded_value * 100.0)
-        self.progress_stage_var.set(stage)
-        self.progress_detail_var.set(detail or "Procesando...")
+        self.progress_stage_var.set(friendly_stage)
+        self.progress_detail_var.set(friendly_detail)
         self.progress_percent_var.set(f"{bounded_value * 100.0:5.1f}%")
+
+    def _friendly_progress_text(self, stage: str, detail: str) -> tuple[str, str]:
+        stage_lower = stage.lower()
+        if "tracking" in stage_lower or "persona" in stage_lower:
+            return "Buscando personas", "Identificando personas y siguiendo su movimiento."
+        if "clasificando" in stage_lower or "ventana" in stage_lower:
+            return "Analizando eventos", "Revisando las secuencias donde aparece cada persona."
+        if "render" in stage_lower:
+            return "Preparando evidencia", "Generando el video anotado para revision."
+        if "modelo" in stage_lower:
+            return "Preparando analisis", "Cargando los modelos de deteccion y clasificacion."
+        if "error" in stage_lower:
+            return "Error", detail or "No fue posible completar el analisis."
+        if "complet" in stage_lower:
+            return "Analisis completado", "La revision termino y los resultados estan disponibles."
+        return stage or "Procesando", "Esperando para analizar."
 
     def _append_log(self, message: str, level: str = "INFO") -> None:
         prefix = f"[{level}] " if level else ""
@@ -1523,115 +1659,327 @@ class TheftDetectionApp:
         self.last_result = result
         self.analyze_button.configure(state="normal")
         self.open_result_button.configure(state="normal")
-        self.open_folder_button.configure(state="normal")
         self.debug_check.configure(state="normal")
         self._update_progress(1.0, "Analisis completado", "Los resultados ya estan disponibles.")
 
         if bool(result.get("video_alert")):
             self.status_var.set("ALERTA: se detectó posible hurto en el video.")
         else:
-            self.status_var.set("No se detectaron ventanas positivas de hurto con el umbral actual.")
+            self.status_var.set("No se detectaron eventos sospechosos en el video.")
 
         self.summary_var.set(
-            "Tracks limpios: "
-            f"{result.get('num_tracks_clean', 0)} | "
-            "Ventanas evaluadas: "
-            f"{result.get('num_windows_evaluated', 0)} | "
-            "Ventanas positivas: "
-            f"{result.get('num_positive_windows', 0)}"
+            f"Personas revisadas: {result.get('num_tracks_clean', 0)} | "
+            f"Eventos sospechosos: {result.get('num_positive_windows', 0)}"
         )
 
         for item_id in self.events_tree.get_children():
             self.events_tree.delete(item_id)
 
-        for event in result.get("top_events", []):
+        top_events = result.get("top_events", [])
+        for person_number, event in enumerate(top_events, start=1):
             if not isinstance(event, dict):
                 continue
-            interval_text = f"{float(event['start_sec']):.2f} - {float(event['end_sec']):.2f}"
-            probability_text = f"{float(event['cnn_prob_hurto']):.2f}"
+            interval_text = f"{format_seconds(float(event['start_sec']))} - {format_seconds(float(event['end_sec']))}"
+            level_text = suspicion_level(float(event["cnn_prob_hurto"]))
             self.events_tree.insert(
                 "",
                 END,
-                values=(int(event["track_id"]), interval_text, probability_text),
+                values=(f"Persona {person_number}", interval_text, level_text),
+                tags=(level_text,),
             )
-
-        best_evidence_path = Path(str(result.get("best_evidence_path", ""))) if result.get("best_evidence_path") else None
-        if best_evidence_path and best_evidence_path.exists():
-            image = Image.open(best_evidence_path)
-            image.thumbnail((500, 380))
-            self.preview_photo = ImageTk.PhotoImage(image)
-            self.preview_label.configure(image=self.preview_photo, text="")
-        else:
-            message = (
-                "No hubo evidencia positiva para mostrar.\n"
-                f"El resumen quedó guardado en:\n{result.get('run_dir', '')}"
-            )
-            self.preview_label.configure(image="", text=message)
-            self.preview_photo = None
+        if not top_events:
+            self.events_tree.insert("", END, values=("Video", "Completo", "Sin alerta"), tags=("Baja",))
 
         if bool(result.get("video_alert")):
             top_event = result.get("top_events", [])[0] if result.get("top_events") else None
             if isinstance(top_event, dict):
+                level_text = suspicion_level(float(top_event["cnn_prob_hurto"]))
                 alert_detail = (
-                    f"Track {int(top_event['track_id'])} entre {float(top_event['start_sec']):.2f}s y "
-                    f"{float(top_event['end_sec']):.2f}s con probabilidad {float(top_event['cnn_prob_hurto']):.2f}."
+                    f"Persona observada entre {format_seconds(float(top_event['start_sec']))} y "
+                    f"{format_seconds(float(top_event['end_sec']))}. Nivel de sospecha: {level_text.lower()}."
                 )
             else:
-                alert_detail = "Se detectaron ventanas positivas en el video analizado."
+                alert_detail = "Se detectaron eventos sospechosos en el video analizado."
             self._set_alert_panel("alert", detail=alert_detail)
+            self._start_alert_sound()
         else:
+            self._stop_alert_sound()
             self._set_alert_panel(
                 "clear",
-                detail=(
-                    f"No se detectaron eventos sobre el umbral {float(result.get('alert_threshold', 0.0)):.2f}. "
-                    "Revisa el video anotado si quieres validar el seguimiento."
-                ),
+                detail="No se detectaron eventos sospechosos con la sensibilidad seleccionada.",
             )
-
-        if best_evidence_path and best_evidence_path.exists():
-            self._set_preview_image(
-                image=Image.open(best_evidence_path),
-                caption="Mejor evidencia de posible hurto",
-                detail=f"Evidencia guardada en: {best_evidence_path}",
-            )
-        else:
-            analyzed_video_path = Path(str(result.get("video_path", ""))) if result.get("video_path") else None
-            if analyzed_video_path and analyzed_video_path.exists():
-                self._show_video_preview(
-                    analyzed_video_path,
-                    caption="Vista previa del video analizado",
-                    detail=f"No hubo evidencia positiva. Resultados guardados en: {result.get('run_dir', '')}",
-                )
-            else:
-                self._set_preview_text(
-                    caption="Resumen del analisis",
-                    message=f"No hubo evidencia visual disponible.\nResultados guardados en: {result.get('run_dir', '')}",
-                    detail="Abre la carpeta de salida para revisar el resumen y el video anotado.",
-                )
 
     def _handle_error(self, error_message: str) -> None:
         self.analyze_button.configure(state="normal")
         self.open_result_button.configure(state="disabled")
-        self.open_folder_button.configure(state="disabled")
         self.debug_check.configure(state="normal")
         self._update_progress(float(self.progress_bar["value"]) / 100.0, "Error", error_message)
         self.status_var.set("El análisis terminó con error.")
         self.summary_var.set("No se generaron resultados.")
+        self._stop_alert_sound()
         self._set_alert_panel("error", detail=error_message)
         messagebox.showerror("Error durante el análisis", error_message)
 
     def _clear_previous_result(self) -> None:
         self.last_result = None
         self.log_text.delete("1.0", END)
-        self.preview_label.configure(image="", text="La mejor evidencia positiva aparecerá aquí.\nSi no hay alerta, se mostrará el resumen en texto.")
-        self.preview_photo = None
+        self._stop_alert_sound()
+        if self.evidence_window is not None and self.evidence_window.winfo_exists():
+            self.evidence_window.destroy()
+        self.evidence_window = None
+        self.evidence_photo = None
         self.open_result_button.configure(state="disabled")
-        self.open_folder_button.configure(state="disabled")
-        self.preview_caption_var.set("Vista previa")
-        self.preview_detail_var.set("Selecciona un video para comenzar.")
         self._update_progress(0.0, "En espera", "Selecciona un video para comenzar.")
         for item_id in self.events_tree.get_children():
             self.events_tree.delete(item_id)
+
+    def _open_evidence_view(self) -> None:
+        if not self.last_result:
+            return
+
+        if self.evidence_window is not None and self.evidence_window.winfo_exists():
+            self.evidence_window.lift()
+            self.evidence_window.focus_force()
+            return
+
+        evidence_window = Toplevel(self.root)
+        self.evidence_window = evidence_window
+        evidence_window.title("Evidencia")
+        evidence_window.geometry("560x480")
+        evidence_window.minsize(420, 340)
+        evidence_window.transient(self.root)
+        evidence_window.protocol("WM_DELETE_WINDOW", self._close_evidence_window)
+
+        canvas = tk.Canvas(evidence_window, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(evidence_window, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=16)
+
+        inner.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw", tags="evidence_inner")
+
+        def on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfig("evidence_inner", width=event.width)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.bindtags((canvas.bindtags() or ()) + ("TScrolledEvidence",))
+        canvas.bind_class(
+            "TScrolledEvidence",
+            "<MouseWheel>",
+            lambda _event: canvas.yview_scroll(int(-1 * (_event.delta / 120)), "units"),
+        )
+
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill="y")
+
+        ttk.Label(inner, text="Evidencia", font=("Segoe UI", 16, "bold")).pack(anchor=W)
+        ttk.Label(
+            inner,
+            text="Mosaico temporal usado por el modelo para generar la alerta.",
+            wraplength=480,
+            justify="left",
+        ).pack(anchor=W, pady=(4, 12))
+
+        mosaic_path = self._get_evidence_mosaic_path()
+        if mosaic_path is not None and mosaic_path.exists():
+            evidence_image = Image.open(mosaic_path)
+            display_image = self._resize_image_for_evidence(evidence_image)
+            self.evidence_photo = ImageTk.PhotoImage(display_image)
+            ttk.Label(inner, image=self.evidence_photo).pack(anchor=W, pady=(0, 12))
+        else:
+            self.evidence_photo = None
+            ttk.Label(
+                inner,
+                text="No hay mosaico de alerta disponible para el ultimo analisis.",
+                wraplength=480,
+                justify="left",
+            ).pack(anchor=W, pady=(0, 12))
+
+        details_text = ScrolledText(inner, height=8, wrap="word")
+        details_text.insert("1.0", self._build_evidence_details_text())
+        details_text.configure(state="disabled")
+        details_text.pack(fill=BOTH, expand=True, pady=(0, 12))
+
+        actions_frame = ttk.Frame(inner)
+        actions_frame.pack(fill="x")
+        ttk.Button(
+            actions_frame,
+            text="Guardar video y mosaico...",
+            command=self._save_evidence_files,
+        ).pack(side=LEFT)
+        ttk.Button(
+            actions_frame,
+            text="Abrir video anotado",
+            command=self._open_last_annotated_video,
+        ).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(
+            actions_frame,
+            text="Abrir informe",
+            command=self._open_run_folder,
+        ).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(
+            actions_frame,
+            text="Cerrar",
+            command=self._close_evidence_window,
+        ).pack(side=RIGHT)
+
+        self._center_window(evidence_window)
+
+    def _close_evidence_window(self) -> None:
+        if self.evidence_window is not None and self.evidence_window.winfo_exists():
+            self.evidence_window.destroy()
+        self.evidence_window = None
+        self.evidence_photo = None
+
+    def _center_window(self, window: Toplevel) -> None:
+        window.update_idletasks()
+        root_x = self.root.winfo_x()
+        root_y = self.root.winfo_y()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        win_w = window.winfo_width()
+        win_h = window.winfo_height()
+        x = root_x + (root_w - win_w) // 2
+        y = root_y + (root_h - win_h) // 2
+        window.geometry(f"+{x}+{y}")
+
+    def _get_evidence_mosaic_path(self) -> Path | None:
+        if not self.last_result:
+            return None
+
+        path_value = (
+            self.last_result.get("mosaic_evidence_path")
+            or self.last_result.get("best_evidence_path")
+            or self.last_result.get("incident_evidence_path")
+            or ""
+        )
+        return Path(str(path_value)) if path_value else None
+
+    def _get_last_annotated_video_path(self) -> Path | None:
+        if not self.last_result:
+            return None
+
+        path_value = str(self.last_result.get("annotated_video_path", ""))
+        return Path(path_value) if path_value else None
+
+    def _get_last_report_path(self) -> Path | None:
+        if not self.last_result:
+            return None
+
+        path_value = str(self.last_result.get("incident_report_path", ""))
+        return Path(path_value) if path_value else None
+
+    def _resize_image_for_evidence(self, image: Image.Image) -> Image.Image:
+        display_image = image.copy()
+        max_width = 620
+        max_height = 360
+        width, height = display_image.size
+        if width <= 0 or height <= 0:
+            return display_image
+
+        scale = min(max_width / width, max_height / height)
+        if scale >= 1.0:
+            resized_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            return display_image.resize(resized_size, Image.Resampling.NEAREST)
+
+        display_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        return display_image
+
+    def _open_last_annotated_video(self) -> None:
+        annotated_video_path = self._get_last_annotated_video_path()
+        if annotated_video_path is None or not annotated_video_path.exists():
+            messagebox.showerror("Archivo no disponible", "No existe el video anotado del ultimo analisis.")
+            return
+
+        try:
+            open_path(annotated_video_path)
+        except Exception as error:  # noqa: BLE001
+            messagebox.showerror("No fue posible abrir el archivo", str(error))
+
+    def _save_evidence_files(self) -> None:
+        if not self.last_result:
+            return
+
+        target_dir_value = filedialog.askdirectory(title="Guardar evidencia")
+        if not target_dir_value:
+            return
+
+        target_dir = Path(target_dir_value)
+        copied_paths: list[Path] = []
+
+        for source_path in [self._get_last_annotated_video_path(), self._get_evidence_mosaic_path()]:
+            if source_path is None or not source_path.exists():
+                continue
+            destination_path = self._unique_destination(target_dir / source_path.name)
+            shutil.copy2(source_path, destination_path)
+            copied_paths.append(destination_path)
+
+        details_path = self._unique_destination(target_dir / "detalles_evidencia.txt")
+        details_path.write_text(self._build_evidence_details_text(), encoding="utf-8")
+        copied_paths.append(details_path)
+
+        copied_text = "\n".join(str(path) for path in copied_paths)
+        messagebox.showinfo("Evidencia guardada", f"Archivos guardados:\n{copied_text}")
+
+    def _unique_destination(self, destination_path: Path) -> Path:
+        if not destination_path.exists():
+            return destination_path
+
+        stem = destination_path.stem
+        suffix = destination_path.suffix
+        parent = destination_path.parent
+        counter = 1
+        while True:
+            candidate_path = parent / f"{stem}_{counter}{suffix}"
+            if not candidate_path.exists():
+                return candidate_path
+            counter += 1
+
+    def _build_evidence_details_text(self) -> str:
+        result = self.last_result or {}
+        top_events = result.get("top_events", [])
+        top_event = top_events[0] if isinstance(top_events, list) and top_events else None
+        mosaic_path = self._get_evidence_mosaic_path()
+        annotated_video_path = self._get_last_annotated_video_path()
+        report_path = self._get_last_report_path()
+
+        lines = [
+            "Informe de evidencia",
+            f"Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Video original: {result.get('video_path', '')}",
+            f"Video anotado: {annotated_video_path or ''}",
+            f"Mosaico de alerta: {mosaic_path or ''}",
+            f"Informe: {report_path or ''}",
+            f"Personas revisadas: {result.get('num_tracks_clean', 0)}",
+            f"Eventos sospechosos: {result.get('num_positive_windows', 0)}",
+            f"Umbral usado: {float(result.get('alert_threshold', 0.0)):.2f}",
+        ]
+
+        if isinstance(top_event, dict):
+            level_text = suspicion_level(float(top_event["cnn_prob_hurto"]))
+            probability_text = f"{float(top_event['cnn_prob_hurto']) * 100:.1f}%"
+            interval_text = (
+                f"{format_seconds(float(top_event['start_sec']))} - "
+                f"{format_seconds(float(top_event['end_sec']))}"
+            )
+            lines.extend(
+                [
+                    "",
+                    "Detalle del evento principal",
+                    f"Track/persona: {int(top_event['track_id'])}",
+                    f"Momento: {interval_text}",
+                    f"Nivel de sospecha: {level_text}",
+                    f"Probabilidad hurto: {probability_text}",
+                    f"Ventana: {top_event.get('sample_id', '')}",
+                ]
+            )
+        else:
+            lines.extend(["", "Detalle del evento principal", "No se detecto alerta."])
+
+        return "\n".join(lines)
 
     def _open_annotated_video(self) -> None:
         if not self.last_result:
@@ -1651,6 +1999,15 @@ class TheftDetectionApp:
         if not self.last_result:
             return
 
+        report_path_value = str(self.last_result.get("incident_report_path", ""))
+        report_path = Path(report_path_value) if report_path_value else None
+        if report_path is not None and report_path.exists():
+            try:
+                open_path(report_path)
+            except Exception as error:  # noqa: BLE001
+                messagebox.showerror("No fue posible abrir el informe", str(error))
+            return
+
         run_dir = Path(str(self.last_result.get("run_dir", "")))
         if not run_dir.exists():
             messagebox.showerror("Carpeta no disponible", "No existe la carpeta del ultimo analisis.")
@@ -1661,6 +2018,16 @@ class TheftDetectionApp:
         except Exception as error:  # noqa: BLE001
             messagebox.showerror("No fue posible abrir la carpeta", str(error))
 
+    def _toggle_advanced_panel(self, _event: object | None = None) -> None:
+        if self.advanced_visible:
+            self.advanced_frame.pack_forget()
+            self.advanced_visible = False
+            self.debug_var.set(False)
+            return
+
+        self.advanced_frame.pack(fill=BOTH, expand=False, pady=(12, 0))
+        self.advanced_visible = True
+
     def _set_alert_panel(self, state: str, detail: str | None = None) -> None:
         palette = {
             "idle": {
@@ -1668,7 +2035,7 @@ class TheftDetectionApp:
                 "fg": "#f8fafc",
                 "detail_fg": "#e5e7eb",
                 "title": "Sistema listo",
-                "detail": "La alerta aparecera aqui cuando el modelo detecte una escena sospechosa.",
+                "detail": "La alerta aparecera aqui cuando se detecte una escena sospechosa.",
             },
             "running": {
                 "bg": "#92400e",
@@ -1682,7 +2049,7 @@ class TheftDetectionApp:
                 "fg": "#ecfdf5",
                 "detail_fg": "#d1fae5",
                 "title": "Sin alerta",
-                "detail": "No se detectaron ventanas positivas con el umbral configurado.",
+                "detail": "No se detectaron eventos sospechosos con la sensibilidad configurada.",
             },
             "alert": {
                 "bg": "#991b1b",
@@ -1718,30 +2085,39 @@ class TheftDetectionApp:
             fg=selected_palette["detail_fg"],
         )
 
-    def _set_preview_image(self, image: Image.Image, caption: str, detail: str) -> None:
-        preview_image = image.copy()
-        preview_image.thumbnail((500, 380))
-        self.preview_photo = ImageTk.PhotoImage(preview_image)
-        self.preview_caption_var.set(caption)
-        self.preview_detail_var.set(detail)
-        self.preview_label.configure(image=self.preview_photo, text="")
+    def _start_alert_sound(self) -> None:
+        if winsound is None:
+            return
 
-    def _set_preview_text(self, caption: str, message: str, detail: str) -> None:
-        self.preview_photo = None
-        self.preview_caption_var.set(caption)
-        self.preview_detail_var.set(detail)
-        self.preview_label.configure(image="", text=message)
+        self._stop_alert_sound()
+        self.alert_sound_stop_event.clear()
+        self.stop_sound_button.configure(state="normal")
 
-    def _show_video_preview(self, video_path: Path, caption: str, detail: str) -> None:
-        try:
-            image = load_video_preview_image(video_path)
-            self._set_preview_image(image=image, caption=caption, detail=detail)
-        except Exception as error:  # noqa: BLE001
-            self._set_preview_text(
-                caption=caption,
-                message=f"No fue posible generar la vista previa.\n{video_path}",
-                detail=str(error),
-            )
+        def alert_loop() -> None:
+            start_time = time.monotonic()
+            duration_s = 7.0
+            while time.monotonic() - start_time < duration_s:
+                if self.alert_sound_stop_event.is_set():
+                    break
+                winsound.Beep(1000, 300)
+                if self.alert_sound_stop_event.wait(0.4):
+                    break
+
+            self.root.after(0, self._stop_alert_sound)
+
+        self.alert_sound_thread = threading.Thread(target=alert_loop, daemon=True)
+        self.alert_sound_thread.start()
+
+    def _stop_alert_sound(self) -> None:
+        self.alert_sound_stop_event.set()
+        self.alert_sound_thread = None
+        self.stop_sound_button.configure(state="disabled")
+
+    def _on_close(self) -> None:
+        self._stop_alert_sound()
+        if self.evidence_window is not None and self.evidence_window.winfo_exists():
+            self.evidence_window.destroy()
+        self.root.destroy()
 
 
 def main() -> None:
